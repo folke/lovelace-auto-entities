@@ -33,6 +33,10 @@ class AutoEntities extends LitElement {
   _updateCooldown = { timer: undefined, rerun: false };
   _cardBuilt?: Promise<void>;
   _cardBuiltResolve?;
+  _throttle = {
+    timer: undefined as number | undefined,
+    count: 0,
+  };
 
   static getConfigElement() {
     return document.createElement("auto-entities-editor");
@@ -101,19 +105,22 @@ class AutoEntities extends LitElement {
     unbind_template(this._renderer);
   }
 
-  async update_all() {
+  async update_all(debounce = true) {
     if (this.card) this.card.hass = this.hass;
     if (this.else) this.else.hass = this.hass;
 
-    if (this._updateCooldown.timer) {
-      this._updateCooldown.rerun = true;
+    // Allow first updates to go through immediately
+    // before starting to debounce
+    if (debounce && this.hass && this._throttle.count++ > 3) {
+      if (this._throttle.timer) return;
+      this._throttle.timer = setTimeout(
+        () => {
+          this._throttle.timer = undefined;
+          this.update_all(false);
+        },
+        (this._config.throttle ?? 0.5) * 1000
+      );
       return;
-    } else {
-      this._updateCooldown.rerun = false;
-      this._updateCooldown.timer = window.setTimeout(() => {
-        this._updateCooldown.timer = undefined;
-        if (this._updateCooldown.rerun) this.update_all();
-      }, 500);
     }
 
     const entities = await this.update_entities();
