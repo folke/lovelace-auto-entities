@@ -10,6 +10,8 @@ import {
   HuiErrorCard,
   LovelaceCard,
   LovelaceRowConfig,
+  FilterConfig,
+  FilterType,
 } from "./types";
 import pjson from "../package.json";
 import "./editor/auto-entities-editor";
@@ -28,15 +30,17 @@ class AutoEntities extends LitElement {
   @property() _template: string[];
   @state() empty = false;
 
+  editMode?: boolean;
+
   _entities: EntityList;
   _cardConfig;
-  _updateCooldown = { timer: undefined, rerun: false };
   _cardBuilt?: Promise<void>;
   _cardBuiltResolve?;
   _throttle = {
     timer: undefined as number | undefined,
     count: 0,
   };
+  _cache: Record<string, { updated: string; filters: FilterConfig[] }> = {};
 
   static getConfigElement() {
     return document.createElement("auto-entities-editor");
@@ -65,6 +69,7 @@ class AutoEntities extends LitElement {
     }
     config = JSON.parse(JSON.stringify(config));
     this._config = config;
+    this._cache = {};
 
     if (
       this._config.filter?.template &&
@@ -136,6 +141,7 @@ class AutoEntities extends LitElement {
 
   async update_card(entities: EntityList) {
     if (
+      !this.editMode &&
       this._entities &&
       compare_deep(entities, this._entities) &&
       compare_deep(this._cardConfig, this._config.card)
@@ -204,16 +210,48 @@ class AutoEntities extends LitElement {
     this.empty =
       entities.length === 0 ||
       entities.every((e) => HIDDEN_TYPES.includes(e.type));
-    const hide =
+    let hide =
       this.empty &&
       this._config.show_empty === false &&
       this._config.else === undefined;
     this.style.display = hide ? "none" : null;
     this.style.margin = hide ? "0" : null;
-    if ((this.card as any).requestUpdate) {
-      await this.updateComplete;
-      (this.card as any).requestUpdate();
+    let parent = this.parentElement;
+    if (parent && this.editMode) {
+      parent = parent.parentElement;
+      hide = false;
     }
+    if (parent && parent.classList.contains("card")) {
+      parent.style.display = hide ? "none" : null;
+    }
+    if ((this.card as any).requestUpdate) {
+      (this.card as any).requestUpdate();
+      await this.updateComplete;
+    }
+  }
+
+  async match(entity: string) {
+    const filters = await this._match(entity, "include");
+    if (filters.length) {
+      const exclude = await this._match(entity, "exclude");
+      if (!exclude.length) return filters;
+    }
+    return [];
+  }
+
+  async _match(entity: string, type: FilterType) {
+    const ret: FilterConfig[] = [];
+
+    if (!this._config.filter?.[type]) return ret;
+
+    for (const filter of this._config.filter?.[type] ?? []) {
+      if (filter.type) continue;
+      if (await filter_entity(this.hass, filter, entity)) {
+        ret.push(filter);
+        if (this._config.unique == "entity" || type == "exclude") break;
+      }
+    }
+    return ret;
   }
 
   async update_entities() {
@@ -224,34 +262,69 @@ class AutoEntities extends LitElement {
 
     let entities: EntityList = [...(this._config?.entities?.map(format) || [])];
 
+    const merge_options = () =>
+      entities.map((e) => ({ ...this._config.card_options, ...e }));
+
     if (!this.hass) {
-      return entities;
+      return merge_options();
     }
 
     if (this._template) {
       entities = entities.concat(this._template.map(format));
     }
-    entities = entities.filter(Boolean);
+
+    // Remove entities that are excluded
+    entities = (
+      await Promise.all(
+        entities.map(async (e) =>
+          e && !(await this._match(e.entity, "exclude")).length ? e : undefined
+        )
+      )
+    ).filter(Boolean);
+
+    entities = merge_options();
 
     if (this._config.filter?.include) {
       const all_entities = Object.keys(this.hass.states).map(format);
+
+      const entities_by_filter: Map<FilterConfig, EntityList> = new Map();
+
+      for (const entity of all_entities) {
+        if (!entity) continue;
+        let filters: FilterConfig[] = [];
+        const updated = this.hass.states[entity.entity].last_updated;
+        const cached = this._cache[entity.entity];
+
+        if (cached && cached.updated === updated) {
+          filters = cached.filters;
+        } else {
+          filters = await this.match(entity.entity);
+          this._cache[entity.entity] = { updated, filters };
+        }
+
+        for (const filter of filters) {
+          if (!entities_by_filter.has(filter))
+            entities_by_filter.set(filter, []);
+          entities_by_filter.get(filter).push(entity);
+        }
+      }
+
       for (const filter of this._config.filter.include) {
         if (filter.type) {
           entities.push(filter);
           continue;
         }
-
         let add: EntityList = [];
-        for (const entity of all_entities) {
-          if (await filter_entity(this.hass, filter, entity.entity))
-            add.push(
-              JSON.parse(
-                JSON.stringify({ ...entity, ...filter.options }).replace(
-                  /this.entity_id/g,
-                  entity.entity
-                )
-              )
-            );
+        for (const entity of entities_by_filter.get(filter) || []) {
+          add.push(
+            JSON.parse(
+              JSON.stringify({
+                ...this._config.card_options,
+                ...entity,
+                ...filter.options,
+              }).replace(/this.entity_id/g, entity.entity)
+            )
+          );
         }
 
         if (filter.sort) {
@@ -268,21 +341,6 @@ class AutoEntities extends LitElement {
       }
     }
 
-    // TODO: Add tests for exclusions
-    if (this._config.filter?.exclude) {
-      for (const filter of this._config.filter.exclude) {
-        const newEntities = [];
-        for (const entity of entities) {
-          if (
-            entity.entity === undefined ||
-            !(await filter_entity(this.hass, filter, entity.entity))
-          )
-            newEntities.push(entity);
-        }
-        entities = newEntities;
-      }
-    }
-
     if (this._config.sort) {
       entities = entities.sort(get_sorter(this.hass, this._config.sort));
       if (this._config.sort.count) {
@@ -291,15 +349,9 @@ class AutoEntities extends LitElement {
       }
     }
 
-    if (this._config.unique) {
+    if (this._config.unique !== "entity" && this._config.unique) {
       let newEntities: EntityList = [];
       for (const e of entities) {
-        if (
-          this._config.unique === "entity" &&
-          e.entity &&
-          newEntities.some((i) => i.entity === e.entity)
-        )
-          continue;
         if (newEntities.some((i) => compare_deep(i, e))) continue;
         newEntities.push(e);
       }

@@ -9,7 +9,9 @@ export interface SortConfig {
   ip?: boolean;
 }
 
-interface FilterConfig {
+export type FilterType = "include" | "exclude";
+
+export interface FilterConfig {
   domain?: string;
   entity_id?: string;
   state?: string;
@@ -47,8 +49,10 @@ export interface AutoEntitiesConfig {
     include?: FilterConfig[];
     exclude?: FilterConfig[];
   };
+  throttle?: number;
 
   card_param?: string;
+  card_options?: any;
 
   show_empty?: boolean;
   else?: any;
